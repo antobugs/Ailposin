@@ -1,0 +1,552 @@
+--==================================================================
+--  THE CHOSEN ONE :: AI BUILDER   (Delta / mobile)
+--  prompt -> AI -> voxel plan -> auto place + shape + paint
+--  game: 11137575513
+--==================================================================
+if getgenv().TCO_BUILDER then pcall(getgenv().TCO_BUILDER.destroy) end
+
+local Players      = game:GetService("Players")
+local HttpService  = game:GetService("HttpService")
+local UIS          = game:GetService("UserInputService")
+local LP           = Players.LocalPlayer
+
+local CFG = {
+    apiKey      = "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",
+    model       = "llama-3.3-70b-versatile",
+    fireDelay   = 0.07,   -- seconds between remote fires
+    findTimeout = 1.5,    -- seconds to wait for a placed brick
+    maxBlocks   = 700,
+    maxGrow     = 14,     -- max increases before we stack a fresh block
+}
+
+local S_CELL = 4          -- current cell size (4 = normal, 1 = detailed)
+local running, aborted = false, false
+local placed, owned = {}, {}   -- placed[cellKey]=brick ; owned[brick]=true
+local statusLbl, progFill, logLbl, btnBuild, btnStop, btnUndo
+
+--============================ helpers =============================
+local function setStatus(t)
+    if statusLbl then statusLbl.Text = "» " .. t end
+end
+
+local function toolEvent(name)
+    local c = LP.Character
+    local tool = LP.Backpack:FindFirstChild(name) or (c and c:FindFirstChild(name))
+    if not tool then return nil end
+    local s = tool:FindFirstChild("Script")
+    local e = s and s:FindFirstChild("Event")
+    return e
+end
+
+local function fire(ev, ...)
+    if not ev then return false end
+    local ok = pcall(ev.FireServer, ev, ...)
+    task.wait(CFG.fireDelay)
+    return ok
+end
+
+local function groundRay(pos, ignore)
+    local rp = RaycastParams.new()
+    rp.FilterType = Enum.RaycastFilterType.Exclude
+    local list = {}
+    if LP.Character then table.insert(list, LP.Character) end
+    for b in pairs(owned) do if b.Parent then table.insert(list, b) end end
+    if ignore then table.insert(list, ignore) end
+    rp.FilterDescendantsInstances = list
+    return workspace:Raycast(pos + Vector3.new(0, 90, 0), Vector3.new(0, -220, 0), rp)
+end
+
+local function snapTo(v, step)
+    return math.floor(v / step + 0.5) * step
+end
+
+local function findNewBrick(expect, tol)
+    local folder = workspace:FindFirstChild("Bricks")
+    if not folder then return nil end
+    local best, bestD = nil, math.huge
+    for _, d in ipairs(folder:GetDescendants()) do
+        if d:IsA("BasePart") and not owned[d] then
+            local dist = (d.Position - expect).Magnitude
+            if dist < tol and dist < bestD then best, bestD = d, dist end
+        end
+    end
+    return best
+end
+
+local function waitBrick(expect, tol)
+    local t0 = os.clock()
+    while os.clock() - t0 < CFG.findTimeout do
+        local b = findNewBrick(expect, tol)
+        if b then owned[b] = true return b end
+        task.wait(0.03)
+    end
+    return nil
+end
+
+--============================ AI call =============================
+local SYSTEM = [[You are a voxel architect for a block building game. Reply with ONE JSON object only, no prose.
+
+Schema:
+{
+  "name": "short name",
+  "color": "#rrggbb",
+  "material": "plastic",
+  "walls": [ {"x":0,"z":0,"h":12,"color":"#rrggbb","material":"plastic"} ],
+  "caps":  [ {"x":0,"y":12,"z":0,"color":"#rrggbb","material":"plastic"} ]
+}
+
+Rules:
+- One unit = one 4x4x4 block. x and z are integers, range -9..9, 0 is centre. y and h are in blocks, h range 2..10.
+- "walls" are columns built solid from the ground up to height h. This is the structure.
+- "caps" are single blocks at height y, used for roofs, floors, sills, beams, trim.
+- Doorways and windows are made by OMITTING wall cells. Do not fill the inside of a building.
+- Roof the top: place caps across the footprint at y = wall height.
+- Keep total wall+caps under 250 entries. Prefer fewer, bigger shapes over fine detail.
+- color/material optional per entry; top-level values are the defaults.
+- material must be one of: plastic, wood, woodplanks, glass, neon, metal, concrete, granite, marble, slate, brick, sand, grass, fabric, ice, foil, cobblestone, diamondplate, corrodedmetal, limestone, pavement, pebble, salt, sandstone, basalt, ground, rock, snow, asphalt, toxic.
+- Real architecture proportions. A house is roughly 6x6x8 blocks with a door and window gaps. Be consistent, no floating pieces without a wall beneath.
+Return valid JSON.]]
+
+local function httpPost(url, body, headers)
+    local fn = request or http_request or (syn and syn.request) or (fluxus and fluxus.request)
+    if not fn then return nil, "no http function" end
+    local ok, res = pcall(fn, { Url = url, Method = "POST", Headers = headers, Body = body })
+    if not ok or type(res) ~= "table" then return nil, "request failed" end
+    return res
+end
+
+local function askAI(prompt)
+    local body = HttpService:JSONEncode({
+        model = CFG.model,
+        temperature = 0.4,
+        max_tokens = 4096,
+        response_format = { type = "json_object" },
+        messages = {
+            { role = "system", content = SYSTEM },
+            { role = "user",   content = prompt },
+        },
+    })
+    local res, err = httpPost("https://api.groq.com/openai/v1/chat/completions", body, {
+        ["Content-Type"]  = "application/json",
+        ["Authorization"] = "Bearer " .. CFG.apiKey,
+    })
+    if not res then return nil, err end
+    if res.StatusCode ~= 200 then
+        return nil, "HTTP " .. tostring(res.StatusCode) .. " " .. tostring(res.Body):sub(1, 120)
+    end
+    local ok, outer = pcall(HttpService.JSONDecode, HttpService, res.Body)
+    if not ok or not outer.choices then return nil, "bad api response" end
+    local content = outer.choices[1].message.content
+    local ok2, plan = pcall(HttpService.JSONDecode, HttpService, content)
+    if not ok2 or type(plan) ~= "table" then return nil, "model returned non-json" end
+    return plan
+end
+
+--============================ plan =============================
+local MATS = {}
+for _, m in ipairs({"plastic","wood","woodplanks","glass","neon","metal","concrete","granite",
+    "marble","slate","brick","sand","grass","fabric","ice","foil","cobblestone","diamondplate",
+    "corrodedmetal","limestone","pavement","pebble","salt","sandstone","basalt","ground","rock",
+    "snow","asphalt","toxic"}) do MATS[m] = true end
+
+local function toColor(hex, fallback)
+    if type(hex) == "string" then
+        local h = hex:gsub("#", "")
+        if #h == 6 then
+            local ok, c = pcall(function()
+                return Color3.fromRGB(tonumber(h:sub(1,2),16), tonumber(h:sub(3,4),16), tonumber(h:sub(5,6),16))
+            end)
+            if ok and c then return c end
+        end
+    end
+    return fallback or Color3.fromRGB(200, 200, 200)
+end
+
+local function cleanPlan(raw)
+    local plan = { walls = {}, caps = {} }
+    local dc = toColor(raw.color)
+    local dm = MATS[tostring(raw.material)] and tostring(raw.material) or "plastic"
+    local seen = {}
+    for _, w in ipairs(raw.walls or {}) do
+        local x, z, h = tonumber(w.x), tonumber(w.z), tonumber(w.h)
+        if x and z and h and math.abs(x) <= 20 and math.abs(z) <= 20 then
+            x, z = math.floor(x), math.floor(z)
+            h = math.clamp(math.floor(h), 1, 30)
+            local k = x .. ":" .. z
+            if not seen[k] then
+                seen[k] = true
+                table.insert(plan.walls, { x = x, z = z, h = h,
+                    color = toColor(w.color, dc),
+                    mat = MATS[tostring(w.material)] and tostring(w.material) or dm })
+            end
+        end
+    end
+    for _, c in ipairs(raw.caps or {}) do
+        local x, y, z = tonumber(c.x), tonumber(c.y), tonumber(c.z)
+        if x and y and z and math.abs(x) <= 20 and math.abs(z) <= 20 then
+            table.insert(plan.caps, { x = math.floor(x), y = math.clamp(math.floor(y), 1, 40), z = math.floor(z),
+                color = toColor(c.color, dc),
+                mat = MATS[tostring(c.material)] and tostring(c.material) or dm })
+        end
+    end
+    plan.name = tostring(raw.name or "build")
+    plan.count = #plan.walls + #plan.caps
+    return plan
+end
+
+--============================ builder =============================
+local gridOff  -- world offset between our anchor grid and the server grid
+local realSize -- measured block size
+
+local function cellWorld(anchor, x, z)
+    return anchor + Vector3.new(x * S_CELL, 0, z * S_CELL) + (gridOff or Vector3.zero)
+end
+
+local function paintBrick(brick, color, mat)
+    local ev = toolEvent("Paint")
+    if not ev then return end
+    pcall(fire, ev, brick, Enum.NormalId.Front, brick.Position, "both", color, mat, "")
+end
+
+local function growColumn(ev, brick, targetY, tol)
+    local grown = 0
+    while brick and brick.Parent and brick.Position.Y < targetY - 0.4 and grown < CFG.maxGrow do
+        local top = brick.Position + Vector3.new(0, brick.Size.Y / 2, 0)
+        pcall(fire, ev, brick, Enum.NormalId.Top, top, "increase")
+        grown += 1
+        local nb = findNewBrick(brick.Position, 0.1)
+        if nb and nb ~= brick then brick = nb else brick = brick end
+        task.wait(0.02)
+    end
+    return brick
+end
+
+local function build(plan)
+    local char = LP.Character
+    local hrp = char and char:FindFirstChild("HumanoidRootPart")
+    if not hrp then return setStatus("no character") end
+
+    local evBuild, evShape = toolEvent("Build"), toolEvent("Shape")
+    if not evBuild then return setStatus("equip the Build tool first") end
+    if not evShape then return setStatus("equip the Shape tool first") end
+    if not workspace:FindFirstChild("Bricks") then return setStatus("no Bricks folder") end
+
+    local hit = groundRay(hrp.Position)
+    if not hit then return setStatus("stand on ground") end
+    local anchor = hit.Position
+    anchor = Vector3.new(snapTo(anchor.X, S_CELL), anchor.Y, snapTo(anchor.Z, S_CELL))
+
+    local total = plan.count
+    if total == 0 then return setStatus("plan empty") end
+    if total > CFG.maxBlocks then return setStatus("too big: " .. total) end
+
+    gridOff = nil
+    running, aborted = true, false
+    btnBuild.Text, btnStop.Visible = "working", true
+
+    local done, failed = 0, 0
+    local function tick()
+        done += 1
+        progFill.Size = UDim2.fromScale(math.min(done / total, 1), 1)
+        setStatus(done .. "/" .. total .. "  (" .. failed .. " failed)")
+    end
+
+    -- calibration pass on the first wall cell
+    local firstW = plan.walls[1]
+    if firstW then
+        local expect = anchor + Vector3.new(firstW.x * S_CELL, 0, firstW.z * S_CELL)
+        local g = groundRay(expect)
+        if g then
+            pcall(fire, evBuild, g.Instance, Enum.NormalId.Top, g.Position, S_CELL >= 4 and "normal" or "detailed")
+            local b = waitBrick(expect, S_CELL * 1.4)
+            if b then
+                gridOff = b.Position - Vector3.new(expect.X, b.Position.Y, expect.Z)
+                gridOff = Vector3.new(gridOff.X, 0, gridOff.Z)
+                realSize = math.max(math.floor(b.Size.X + 0.5), 1)
+                S_CELL = realSize
+                local targetY = anchor.Y + firstW.h * S_CELL
+                b = growColumn(evShape, b, targetY, 0.4)
+                if b then
+                    paintBrick(b, firstW.color, firstW.mat)
+                    placed[firstW.x .. ":" .. firstW.z] = b
+                else failed += 1 end
+            else failed += 1 end
+            tick()
+        end
+    end
+
+    -- walls
+    for i = 2, #plan.walls do
+        if aborted then break end
+        local w = plan.walls[i]
+        local world = cellWorld(anchor, w.x, w.z)
+        local g = groundRay(world)
+        if g then
+            pcall(fire, evBuild, g.Instance, Enum.NormalId.Top, g.Position, S_CELL >= 4 and "normal" or "detailed")
+            local b = waitBrick(world, S_CELL * 1.4)
+            if b then
+                b = growColumn(evShape, b, anchor.Y + w.h * S_CELL, 0.4)
+                paintBrick(b, w.color, w.mat)
+                placed[w.x .. ":" .. w.z] = b
+            else
+                failed += 1
+            end
+        else failed += 1 end
+        tick()
+        if i % 6 == 0 then task.wait(0.05) end
+    end
+
+    -- caps (roof / floor / trim) with side-chaining
+    local sides = {
+        { f = Enum.NormalId.Right, o = Vector3.new(1, 0, 0) },
+        { f = Enum.NormalId.Left,  o = Vector3.new(-1, 0, 0) },
+        { f = Enum.NormalId.Back,  o = Vector3.new(0, 0, 1) },
+        { f = Enum.NormalId.Front, o = Vector3.new(0, 0, -1) },
+    }
+    table.sort(plan.caps, function(a, b)
+        if a.y ~= b.y then return a.y < b.y end
+        if a.z ~= b.z then return a.z < b.z end
+        return a.x < b.x
+    end)
+    for _, c in ipairs(plan.caps) do
+        if aborted then break end
+        local world = cellWorld(anchor, c.x, c.z)
+        local targetY = anchor.Y + c.y * S_CELL
+        local brick
+        -- try support straight below
+        local below = placed[c.x .. ":" .. c.z]
+        if below and below.Parent and math.abs(below.Position.Y + below.Size.Y / 2 - targetY) < S_CELL * 1.5 then
+            pcall(fire, evBuild, below, Enum.NormalId.Top,
+                below.Position + Vector3.new(0, below.Size.Y / 2, 0), S_CELL >= 4 and "normal" or "detailed")
+            brick = waitBrick(world, S_CELL * 1.4)
+        else
+            -- chain off a neighbour at the same height
+            for _, s in ipairs(sides) do
+                local nb = placed[(c.x + math.floor(s.o.X)) .. ":" .. (c.z + math.floor(s.o.Z))]
+                if nb and nb.Parent and math.abs(nb.Position.Y - targetY) < S_CELL then
+                    pcall(fire, evBuild, nb, s.f, nb.Position + s.o * (nb.Size.X / 2),
+                        S_CELL >= 4 and "normal" or "detailed")
+                    brick = waitBrick(world, S_CELL * 1.4)
+                    if brick then break end
+                end
+            end
+        end
+        if brick then
+            paintBrick(brick, c.color, c.mat)
+            placed[c.x .. ":" .. c.z] = brick
+        else
+            failed += 1
+        end
+        tick()
+        if done % 6 == 0 then task.wait(0.05) end
+    end
+
+    running = false
+    btnBuild.Text, btnStop.Visible = "build", false
+    if aborted then setStatus("stopped at " .. done .. "/" .. total)
+    else setStatus("done  " .. (total - failed) .. "/" .. total .. "  failed " .. failed) end
+end
+
+local function undoAll()
+    local evDel = toolEvent("Delete")
+    local list = {}
+    for b in pairs(owned) do if b.Parent then table.insert(list, b) end end
+    if #list == 0 then return setStatus("nothing to undo") end
+    if not evDel then return setStatus("equip Delete tool to undo") end
+    setStatus("removing " .. #list)
+    for i = #list, 1, -1 do
+        local b = list[i]
+        pcall(fire, evDel, b, Enum.NormalId.Front, b.Position)
+        task.wait(0.02)
+    end
+    table.clear(placed); table.clear(owned)
+    progFill.Size = UDim2.fromScale(0, 1)
+    setStatus("cleared")
+end
+
+--============================ GUI =============================
+local gui = Instance.new("ScreenGui")
+gui.Name = "TCOBuilder"
+gui.IgnoreGuiInset = true
+gui.ResetOnSpawn = false
+gui.DisplayOrder = 9999
+gui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+gui.Parent = LP:WaitForChild("PlayerGui")
+
+local main = Instance.new("Frame")
+main.Size = UDim2.fromOffset(268, 214)
+main.Position = UDim2.new(0, 14, 0.5, -107)
+main.BackgroundColor3 = Color3.fromRGB(20, 21, 26)
+main.BorderSizePixel = 0
+main.Active = true
+main.Parent = gui
+local corner = Instance.new("UICorner"); corner.CornerRadius = UDim.new(0, 10); corner.Parent = main
+local stroke = Instance.new("UIStroke"); stroke.Color = Color3.fromRGB(58, 62, 78); stroke.Thickness = 1; stroke.Parent = main
+
+local header = Instance.new("Frame")
+header.Size = UDim2.new(1, 0, 0, 30)
+header.BackgroundColor3 = Color3.fromRGB(28, 30, 38)
+header.BorderSizePixel = 0
+header.Parent = main
+local hc = Instance.new("UICorner"); hc.CornerRadius = UDim.new(0, 10); hc.Parent = header
+
+local title = Instance.new("TextLabel")
+title.Size = UDim2.new(1, -60, 1, 0)
+title.Position = UDim2.fromOffset(10, 0)
+title.BackgroundTransparency = 1
+title.Font = Enum.Font.GothamBold
+title.TextSize = 12
+title.TextXAlignment = Enum.TextXAlignment.Left
+title.TextColor3 = Color3.fromRGB(235, 235, 245)
+title.Text = "AI BUILDER  ·  drag"
+title.Parent = header
+
+local btnClose = Instance.new("TextButton")
+btnClose.Size = UDim2.fromOffset(22, 22)
+btnClose.Position = UDim2.new(1, -28, 0, 4)
+btnClose.BackgroundColor3 = Color3.fromRGB(46, 48, 60)
+btnClose.Text = "×"
+btnClose.TextSize = 14
+btnClose.Font = Enum.Font.GothamBold
+btnClose.TextColor3 = Color3.fromRGB(230, 230, 240)
+btnClose.BorderSizePixel = 0
+btnClose.Parent = header
+local cc = Instance.new("UICorner"); cc.CornerRadius = UDim.new(0, 6); cc.Parent = btnClose
+
+local box = Instance.new("TextBox")
+box.Size = UDim2.new(1, -20, 0, 46)
+box.Position = UDim2.fromOffset(10, 38)
+box.BackgroundColor3 = Color3.fromRGB(30, 32, 40)
+box.TextColor3 = Color3.fromRGB(225, 225, 235)
+box.PlaceholderText = "describe what to build..."
+box.PlaceholderColor3 = Color3.fromRGB(110, 114, 130)
+box.Font = Enum.Font.Gotham
+box.TextSize = 12
+box.TextWrapped = true
+box.TextXAlignment = Enum.TextXAlignment.Left
+box.TextYAlignment = Enum.TextYAlignment.Top
+box.ClearTextOnFocus = false
+box.BorderSizePixel = 0
+box.Parent = main
+local bc = Instance.new("UICorner"); bc.CornerRadius = UDim.new(0, 8); bc.Parent = box
+
+local function mkBtn(text, x, w, color, parent)
+    local b = Instance.new("TextButton")
+    b.Size = UDim2.fromOffset(w, 30)
+    b.Position = UDim2.fromOffset(x, 0)
+    b.BackgroundColor3 = color
+    b.Text = text
+    b.TextSize = 12
+    b.Font = Enum.Font.GothamBold
+    b.TextColor3 = Color3.fromRGB(240, 240, 248)
+    b.BorderSizePixel = 0
+    b.AutoButtonColor = true
+    b.Parent = parent
+    local c = Instance.new("UICorner"); c.CornerRadius = UDim.new(0, 7); c.Parent = b
+    return b
+end
+
+local row = Instance.new("Frame")
+row.Size = UDim2.new(1, -20, 0, 30)
+row.Position = UDim2.fromOffset(10, 90)
+row.BackgroundTransparency = 1
+row.Parent = main
+
+btnBuild = mkBtn("build", 0, 78, Color3.fromRGB(46, 108, 76), row)
+local btnSize = mkBtn("cell 4", 84, 58, Color3.fromRGB(44, 46, 58), row)
+btnStop = mkBtn("stop", 148, 50, Color3.fromRGB(120, 52, 52), row)
+btnStop.Visible = false
+btnUndo = mkBtn("undo", 204, 44, Color3.fromRGB(44, 46, 58), row)
+
+local barBg = Instance.new("Frame")
+barBg.Size = UDim2.new(1, -20, 0, 6)
+barBg.Position = UDim2.fromOffset(10, 126)
+barBg.BackgroundColor3 = Color3.fromRGB(38, 40, 50)
+barBg.BorderSizePixel = 0
+barBg.Parent = main
+local bgc = Instance.new("UICorner"); bgc.CornerRadius = UDim.new(1, 0); bgc.Parent = barBg
+
+progFill = Instance.new("Frame")
+progFill.Size = UDim2.fromScale(0, 1)
+progFill.BackgroundColor3 = Color3.fromRGB(90, 190, 130)
+progFill.BorderSizePixel = 0
+progFill.Parent = barBg
+local pfc = Instance.new("UICorner"); pfc.CornerRadius = UDim.new(1, 0); pfc.Parent = progFill
+
+statusLbl = Instance.new("TextLabel")
+statusLbl.Size = UDim2.new(1, -20, 0, 16)
+statusLbl.Position = UDim2.fromOffset(10, 138)
+statusLbl.BackgroundTransparency = 1
+statusLbl.Font = Enum.Font.Gotham
+statusLbl.TextSize = 11
+statusLbl.TextXAlignment = Enum.TextXAlignment.Left
+statusLbl.TextColor3 = Color3.fromRGB(150, 154, 170)
+statusLbl.Text = "» idle"
+statusLbl.Parent = main
+
+logLbl = Instance.new("TextLabel")
+logLbl.Size = UDim2.new(1, -20, 0, 56)
+logLbl.Position = UDim2.fromOffset(10, 154)
+logLbl.BackgroundTransparency = 1
+logLbl.Font = Enum.Font.Code
+logLbl.TextSize = 10
+logLbl.TextWrapped = true
+logLbl.TextXAlignment = Enum.TextXAlignment.Left
+logLbl.TextYAlignment = Enum.TextYAlignment.Top
+logLbl.TextColor3 = Color3.fromRGB(120, 200, 160)
+logLbl.Text = "ready"
+logLbl.Parent = main
+
+-- drag
+local dragging, dragStart, startPos
+header.InputBegan:Connect(function(i)
+    if i.UserInputType == Enum.UserInputType.MouseButton1 or i.UserInputType == Enum.UserInputType.Touch then
+        dragging, dragStart, startPos = true, i.Position, main.Position
+    end
+end)
+UIS.InputChanged:Connect(function(i)
+    if dragging and (i.UserInputType == Enum.UserInputType.MouseMovement or i.UserInputType == Enum.UserInputType.Touch) then
+        local d = i.Position - dragStart
+        main.Position = UDim2.new(startPos.X.Scale, startPos.X.Offset + d.X, startPos.Y.Scale, startPos.Y.Offset + d.Y)
+    end
+end)
+UIS.InputEnded:Connect(function(i)
+    if i.UserInputType == Enum.UserInputType.MouseButton1 or i.UserInputType == Enum.UserInputType.Touch then
+        dragging = false
+    end
+end)
+
+--============================ wiring =============================
+btnClose.MouseButton1Click:Connect(function() gui.Enabled = not gui.Enabled end)
+btnSize.MouseButton1Click:Connect(function()
+    if S_CELL >= 4 then S_CELL, btnSize.Text = 1, "cell 1" else S_CELL, btnSize.Text = 4, "cell 4" end
+end)
+btnStop.MouseButton1Click:Connect(function() aborted = true end)
+btnUndo.MouseButton1Click:Connect(function() if not running then undoAll() end end)
+
+btnBuild.MouseButton1Click:Connect(function()
+    if running then return end
+    local prompt = box.Text:gsub("^%s+", ""):gsub("%s+$", "")
+    if prompt == "" then return setStatus("type a prompt") end
+    logLbl.Text = "asking model..."
+    setStatus("thinking")
+    task.spawn(function()
+        local plan, err = askAI(prompt)
+        if not plan then
+            setStatus("ai error")
+            logLbl.Text = tostring(err)
+            return
+        end
+        local clean = cleanPlan(plan)
+        if clean.count == 0 then
+            setStatus("empty plan")
+            logLbl.Text = HttpService:JSONEncode(plan):sub(1, 300)
+            return
+        end
+        logLbl.Text = clean.name .. "  ·  " .. #clean.walls .. " walls, " .. #clean.caps .. " caps"
+        build(clean)
+    end)
+end)
+
+getgenv().TCO_BUILDER = { destroy = function() pcall(gui.Destroy, gui) end }
+setStatus("idle")
